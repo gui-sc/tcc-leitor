@@ -1,26 +1,3 @@
-/**
- * ESP32-CAM (AI Thinker) — Stream MJPEG + Leitura de QR + 2 Servos
- *
- * Endpoints:
- *   /        -> página com <img src="/stream"> e status do QR
- *   /stream  -> MJPEG ao vivo
- *   /jpg     -> foto única
- *   /qr      -> JSON com o último QR {valid, text, age_ms, route}
- *
- * Ações:
- *   Se QR conter "ORGANICO"   -> move servo ESQUERDA
- *   Se QR conter "RECICLAVEL" -> move servo DIREITA
- *
- * IDE:
- *   - Placa: AI Thinker ESP32-CAM
- *   - PSRAM Enabled
- *   - Partition: Huge APP (3MB No OTA)
- *
- * Atenção:
- *   - Sem microSD: podemos usar GPIO14/15 para servos.
- *   - Servos com fonte externa 5V e GND comum.
- */
-
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_camera.h"
@@ -35,7 +12,7 @@
 #define WIFI_SSID ""
 #define WIFI_PASS ""
 
-// ====== HTML simples (raw literal p/ evitar erro de aspas na IDE) ======
+// ====== HTML simples ======
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -81,29 +58,24 @@ static const char* KEY_RIGHT = "RECICLAVEL";
 static char g_last_route[8] = "NONE"; // "LEFT" | "RIGHT" | "NONE"
 
 // ====== Servos ======
-// Sem microSD: 14 e 15 costumam funcionar no AI Thinker (evite SD)
-const int SERVO_LEFT_PIN  = 2;  // esquerda
+const int SERVO_PIN  = 2; 
 
-// Ângulos (ajuste conforme mecânica)
-const int SERVO_NEUTRAL     = 90;
-const int SERVO_LEFT_OPEN   = 45; // esquerda "abre"
+// Ângulos
+const int SERVO_NEUTRAL     = 95;
+const int SERVO_LEFT_OPEN   = 40; // esquerda "abre"
 const int SERVO_RIGHT_OPEN  = 135;   // direita "abre"
 const uint16_t OPEN_TIME_MS = 1800; // tempo segurando aberto
 
-Servo servoLeft;
+Servo servo;
 
-// Evitar conflito de timers LEDC com a câmera
-// Alocamos timers diferentes de 0 (XCLK usa LEDC_TIMER_0)
 void setupServoPWM() {
   ESP32PWM::allocateTimer(1);
   ESP32PWM::allocateTimer(2);
-  // (se precisar de mais servos, aloque também 3)
 }
 
-// ====== Qualidade do JPEG (stream/foto quando precisar converter) ======
-static int g_jpeg_quality = 10; // 6..12 (menor = melhor; mais pesado)
+// ====== Qualidade do JPEG ======
+static int g_jpeg_quality = 10;
 
-// ====== Funções util ======
 static inline bool containsNoCase(const String& big, const char* key) {
   String b = big; b.toUpperCase();
   String k = String(key); k.toUpperCase();
@@ -119,20 +91,19 @@ static void json_escape(const char* in, String &out) {
   }
 }
 
-// ====== Movimento de servos ======
+// ====== Movimento do servo ======
 void moveLeft() {
-  servoLeft.write(SERVO_LEFT_OPEN);
+  servo.write(SERVO_LEFT_OPEN);
   delay(OPEN_TIME_MS);
-  servoLeft.write(SERVO_NEUTRAL);
+  servo.write(SERVO_NEUTRAL);
 }
 
 void moveRight() {
-  servoLeft.write(SERVO_RIGHT_OPEN);
+  servo.write(SERVO_RIGHT_OPEN);
   delay(OPEN_TIME_MS);
-  servoLeft.write(SERVO_NEUTRAL);
+  servo.write(SERVO_NEUTRAL);
 }
 
-// ====== Task consumidora do QR ======
 void qrConsumerTask(void *pv) {
   for (;;) {
     if (reader.receiveQrCode(&g_qr, 100)) {
@@ -151,7 +122,6 @@ void qrConsumerTask(void *pv) {
   }
 }
 
-// ====== HTTP Handlers ======
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
   return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
@@ -233,7 +203,6 @@ static esp_err_t qr_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, json.c_str());
 }
 
-// ====== HTTP server ======
 static void start_http_server() {
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
@@ -252,25 +221,20 @@ static void start_http_server() {
   }
 }
 
-// ====== Setup / Loop ======
-
 void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n[ESP32-CAM] Boot");
 
-  // Desliga flash e brownout (evita resets)
   pinMode(4, OUTPUT); digitalWrite(4, LOW);
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
-  // --- Inicializa o leitor (ele inicia a câmera por baixo dos panos) ---
   Serial.println("reader.setup()...");
   reader.setup();
 
-  // Ajustes do sensor (resolução mais estável para QR + stream)
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_framesize(s, FRAMESIZE_QVGA);  // estável para QR + MJPEG
+    s->set_framesize(s, FRAMESIZE_QVGA);
     s->set_quality(s, g_jpeg_quality);
     s->set_lenc(s, 1);
     s->set_sharpness(s, 1);
@@ -279,18 +243,23 @@ void setup() {
   Serial.println("reader.beginOnCore(1)...");
   reader.beginOnCore(1);
 
-  // Task que consome os QRs decodificados
   xTaskCreatePinnedToCore(qrConsumerTask, "qrConsumer", 10 * 1024, NULL, 3, NULL, 0);
 
-  // --- Servos ---
+  // --- Servo ---
   setupServoPWM();
-  servoLeft.setPeriodHertz(50);
-  servoLeft.attach(SERVO_LEFT_PIN);
-  servoLeft.write(SERVO_NEUTRAL);
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN);
+  servo.write(SERVO_NEUTRAL);
 
   // --- Wi-Fi + HTTP ---
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  if (strlen(WIFI_PASS) == 0) {
+    WiFi.begin(WIFI_SSID);       // rede aberta (sem senha)
+  } else {
+    WiFi.begin(WIFI_SSID, WIFI_PASS);  // rede com senha
+  }
+
   Serial.printf("[WiFi] Conectando em %s", WIFI_SSID);
   while (WiFi.status() != WL_CONNECTED) { Serial.print("."); delay(500); }
   Serial.println();
@@ -305,7 +274,6 @@ void setup() {
   Serial.println("  /qr     -> último QR (JSON)");
 }
 
-// Debounce para não acionar servo repetidamente com o mesmo QR
 const uint32_t ACTION_DEBOUNCE_MS = 2500;
 
 void loop() {
@@ -313,7 +281,6 @@ void loop() {
   static uint32_t lastActionAt = 0;
 
   if (g_has_qr) {
-    // Copia o texto atual
     String payload = String(g_last_qr_text);
     g_has_qr = false;
 
@@ -335,7 +302,6 @@ void loop() {
       } else {
         Serial.println("[ROUTE] Sem correspondência (nenhum servo acionado)");
         strcpy(g_last_route, "NONE");
-        // Não atualiza lastHandled para permitir tentar de novo
       }
     }
   }
